@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "澄读 · 阅读模式",
+  "version": "0.1.0",
+  "description": "沉浸式阅读模式，自动清理正文中的空白行与多余间距，让长文更清爽易读。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "chengdu-reader@local.dev",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "file:///*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "action": {
+    "default_title": "进入阅读模式 (Ctrl+Shift+U)",
+    "default_icon": {
+      "16": "icons/icon.svg",
+      "32": "icons/icon.svg",
+      "48": "icons/icon.svg",
+      "96": "icons/icon.svg"
+    }
+  },
+  "background": {
+    "scripts": [
+      "src/shared/fetch-page.js",
+      "src/background.js"
+    ]
+  },
+  "commands": {
+    "toggle-reader": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+U"
+      },
+      "description": "切换阅读模式"
+    }
+  },
+  "icons": {
+    "16": "icons/icon.svg",
+    "32": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  }
+}

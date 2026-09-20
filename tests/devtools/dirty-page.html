@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>测试文章：城市里的树｜澄读测试页</title>
+<style>
+  :root { --brand: #2f6ae0; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    color: #222; background: #f5f6f8; line-height: 1.7;
+  }
+  /* 站点级的大间距样式：阅读模式必须把它压平（这部分不会被 copy 进阅读视图，
+     因为阅读视图在 shadow DOM 里用自己的节律） */
+  .site-header { background: #fff; border-bottom: 1px solid #e3e6ea; padding: 14px 24px; position: sticky; top: 0; }
+  .site-header nav a { margin-right: 16px; color: #555; text-decoration: none; font-size: 14px; }
+  .layout { display: flex; gap: 32px; max-width: 1100px; margin: 0 auto; padding: 28px 24px 80px; }
+  article { flex: 1 1 auto; min-width: 0; background: #fff; padding: 36px 40px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  aside { flex: 0 0 240px; }
+  .ad, .promo { background: #fff3cd; border: 1px solid #ffe08a; border-radius: 8px; padding: 18px; margin-bottom: 18px; font-size: 14px; }
+  h1 { font-size: 28px; line-height: 1.35; margin: 0 0 10px; }
+  .meta { color: #888; font-size: 14px; margin-bottom: 28px; }
+  /* 作者内联了夸张的段落间距——这正是「空白行」的第二大来源 */
+  article p { margin: 42px 0; font-size: 17px; color: #2b2b2b; }
+  blockquote { margin: 48px 0; padding: 8px 0 8px 18px; border-left: 4px solid #d6dae0; color: #666; }
+  footer { text-align: center; color: #999; font-size: 13px; padding: 40px 0; }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a href="/">首页</a><a href="/tech">科技</a><a href="/life">生活</a><a href="/about">关于</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <article>
+    <h1>城市里的树</h1>
+    <div class="meta">文 / 林知远 · 2026 年 3 月 12 日 · 阅读约 6 分钟</div>
+
+    <p>每天早晨我都要走过一条种着法国梧桐的街道。那些树是上世纪五十年代栽下的，如今树干粗得需要两个人才能合抱。夏天的时候，树冠在头顶连成一片，把整条街罩在阴凉里。</p>
+
+    <!-- 空段落：只有空白 -->
+    <p></p>
+    <p> </p>
+
+    <p>园林部门的人说，这些树是这座城市最老的居民。它们比街上任何一栋楼都年长，见过这条街从煤渣路变成柏油路，见过马车、自行车、公交车和电动车轮番驶过。</p>
+
+    <!-- 零宽字符段落：Circle/Readability 类工具都会漏掉的那种 -->
+    <p>​​​</p>
+    <p>‌‍</p>
+    <p>⁠</p>
+
+    <p>我常常想，一棵树是怎么"看"一条街的。它没有眼睛，却对光极其敏感；春天第一缕暖意，它比谁都先知道。</p>
+
+    <!-- 纯 nbsp 段落 + 空 div -->
+    <p>&nbsp;</p>
+    <div></div>
+    <div><div>&nbsp;</div></div>
+
+    <blockquote>
+      树不说话，但它记录时间的方式比钟表更诚实——每一圈年轮都是一年，不多不少。
+    </blockquote>
+
+    <!-- 连排 br 制造的空行 -->
+    <p>去年冬天那场大雪压断了不少枝桠。<br><br><br><br>开春后，断口处抽出新芽，嫩得发亮。</p>
+
+    <p style="margin: 80px 0;">园林工人给每棵树都做了编号，钉在离地一米五的位置。我数过，这条街一共六十七棵。</p>
+
+    <!-- 只含 span 的段落 -->
+    <p><span></span></p>
+    <p><span>  </span></p>
+
+    <p>六十七棵树，六十七个编号。它们不会互相交谈，却在同一个季节一起发芽，一起落叶。这种同步不需要任何约定，只需要同一片天空。</p>
+
+    <hr>
+
+    <p>前几天路过，看见一个小孩在树下捡拾落的果子。她的母亲站在旁边，耐心地等。我想，等这孩子长大，这些树大概还会在这里。</p>
+
+    <!-- 图片：必须保留 -->
+    <p><img src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='640' height='300'%3E%3Crect width='640' height='300' fill='%23dfe7f3'/%3E%3Ctext x='320' y='160' font-size='22' fill='%23566' text-anchor='middle' font-family='sans-serif'%3E街道与梧桐（示意图）%3C/text%3E%3C/svg%3E" alt="街道与梧桐"></p>
+
+    <p>也许这就是城市里那些树的意义：它们不提供任何实用价值，却让一条街有了记忆的形状。</p>
+
+    <p>傍晚的光斜过来，树影被拉得很长。我踩着影子走回家，感觉这一天算是完整了。</p>
+
+    <p></p>
+    <p>&nbsp;</p>
+  </article>
+
+  <aside>
+    <div class="ad">这里是广告位——阅读模式应该把它去掉。</div>
+    <div class="promo">相关推荐<br>· 街道的命名<br>· 老城区的排水<br>· 城市绿化简史</div>
+  </aside>
+</div>
+
+<footer>© 2026 示例站点 · 本站内容仅用于阅读扩展测试</footer>
+
+</body>
+</html>
