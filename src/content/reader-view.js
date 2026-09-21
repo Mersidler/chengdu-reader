@@ -52,9 +52,11 @@
    * @param {object} deps.toolbar        工具条模块
    * @param {Function} [deps.onPrefsChange] 用户改动设置时回调（用于持久化）
    * @param {Function} [deps.onToggleClean] 切换「空行清理」开关时回调（需重新提取）
+   * @param {Function} [deps.onToggleAutoNext] 切换「自动续页」开关时回调
+   * @param {Function} [deps.onToggleTts] 切换「有声朗读」开关时回调
    */
   function createReaderView(deps) {
-    const { prefs, styles, toolbar, onPrefsChange, onToggleClean } = deps;
+    const { prefs, styles, toolbar, onPrefsChange, onToggleClean, onToggleAutoNext, onToggleTts } = deps;
 
     /** @type {{host:Element, shadow:ShadowRoot, scroll:Element, content:Element, prefs:object, restore:Function}|null} */
     let session = null;
@@ -171,6 +173,8 @@
             onChange: applyPrefs,
             onClose: () => close(),
             onToggleClean: onToggleClean,
+            onToggleAutoNext: onToggleAutoNext,
+            onToggleTts: onToggleTts,
             cleanStats: article.cleanStats,
           })
         : null;
@@ -235,6 +239,13 @@
      * 为什么需要动态测量：工具条控件多，窄视口或大字号下会 `flex-wrap` 换成两行，
      * 写死的 padding 就会导致正文被遮住标题（实机截图中确实出现过）。
      * 实测高度最稳，且能同时适配一行/两行。
+     *
+     * ## 为什么底部留白也在这里统一算
+     *
+     * 之前底部 padding 由 setStatus 单独设置，朗读播放条出现后就有两处
+     * 写同一个属性，互相覆盖（表现为「播放条遮住最后一行」或
+     * 「状态条消失后底部仍留着空白」）。现在统一由本函数根据
+     * **所有浮层的高度之和**计算一次，是唯一的权威。
      */
     function syncScrollInset() {
       if (!session) return;
@@ -249,13 +260,23 @@
         ? window.matchMedia("(max-width: 640px)").matches
         : false;
 
+      // 底部浮层：状态条与朗读播放条都固定在视口底部，它们的高度
+      // 必须累加进底部留白，否则会盖住正文最后几行。
+      const statusEl = shadow.querySelector(".rd-status");
+      const ttsEl = shadow.querySelector(".rd-tts-bar");
+      const statusH = statusEl ? (statusEl.getBoundingClientRect().height || 0) : 0;
+      const ttsH = ttsEl ? (ttsEl.getBoundingClientRect().height || 0) : 0;
+      const bottomOverlay = statusH + ttsH;
+
       if (isBottomBar) {
-        // 小屏时工具条贴底，改为给底部留白。
+        // 小屏：工具条也贴底，一并计入底部留白
         scroll.style.paddingTop = "";
-        scroll.style.paddingBottom = `${Math.round(barHeight) + 32}px`;
+        scroll.style.paddingBottom = `${Math.round(bottomOverlay + barHeight) + 32}px`;
       } else {
-        scroll.style.paddingBottom = "";
         scroll.style.paddingTop = `${Math.round(barHeight) + 26}px`;
+        scroll.style.paddingBottom = bottomOverlay > 0
+          ? `${Math.round(bottomOverlay) + 40}px`
+          : "";
       }
     }
 
@@ -313,7 +334,7 @@
     function close() {
       if (!session) return;
 
-      const { host, restore, statusEl } = session;
+      const { host, restore, statusEl, ttsBar } = session;
       session = null;
 
       // 解绑滚动监听：由 onScrollNearBottom 返回的退订函数负责，
@@ -328,6 +349,9 @@
       }
 
       if (statusEl) statusEl.remove();
+      // 播放条由 main.js 创建并持有引用，这里只负责从 DOM 摘掉；
+      // 引擎自身的销毁由 main.js 的 closeReader 统一负责。
+      if (ttsBar && ttsBar.parentNode) ttsBar.parentNode.removeChild(ttsBar);
       if (host && host.parentNode) host.parentNode.removeChild(host);
       restore();
     }
@@ -401,8 +425,9 @@
           session.statusEl.remove();
           session.statusEl = null;
         }
-        // 撤掉为状态条预留的底部空间
-        session.scroll.style.paddingBottom = "";
+        // 底部留白统一由 syncScrollInset 重算（它会把播放条的高度也算进去），
+        // 这里不再自己写 paddingBottom —— 两处写同一属性会互相覆盖。
+        syncScrollInset();
       };
 
       if (!status || status.state === "idle" || status.state === "off") {
@@ -424,9 +449,8 @@
       el.textContent = status.message || "";
       el.dataset.state = status.state;
 
-      // 状态条覆盖在内容之上，给滚动容器补足底部留白，避免遮住最后几行。
-      const h = (el.getBoundingClientRect && el.getBoundingClientRect().height) || 44;
-      session.scroll.style.paddingBottom = `${Math.round(h) + 40}px`;
+      // 状态条覆盖在内容之上，重算底部留白（含播放条）避免遮住最后几行。
+      syncScrollInset();
     }
 
     /** 滚动监听是否已绑定（供自动翻页判定）。 */
@@ -453,6 +477,72 @@
       return unsub;
     }
 
+    /**
+     * 高亮 / 取消高亮一个正文块（朗读跟随用）。
+     *
+     * 用 class 而不是内联样式：样式表在 shadow 内已定义 .rd-tts-active，
+     * 且它随主题变化（内联样式无法跟随主题切换）。
+     *
+     * @param {Element|null} block
+     * @param {boolean} on
+     */
+    function highlightBlock(block, on) {
+      if (!block || !block.classList) return;
+      try {
+        if (on) block.classList.add("rd-tts-active");
+        else block.classList.remove("rd-tts-active");
+      } catch (_) {
+        /* 忽略：高亮失败不应影响朗读 */
+      }
+    }
+
+    /**
+     * 把某个正文块滚动到视口中央（朗读跟随用）。
+     *
+     * 用 scrollIntoView({block:"center"}) 而不是手算 scrollTop：
+     * 块可能嵌在嵌套结构里，手算容易出错。
+     * 注意要传 behavior:"auto"（立即）而不是 "smooth"——
+     * 朗读每几十秒跳一次，平滑滚动反而显得拖沓。
+     *
+     * @param {Element|null} block
+     */
+    function scrollToBlock(block) {
+      if (!block || !session) return;
+      try {
+        block.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+      } catch (_) {
+        /* 老环境不支持 options 对象时忽略 */
+      }
+    }
+
+    /**
+     * 挂载朗读播放条元素（由 main.js 创建后交进来）。
+     *
+     * 为什么由外部创建、这里挂载：播放条需要 tts 引擎的引用，
+     * 而引擎依赖 view 的 content/scroll，两者互相依赖。
+     * 让 main.js 负责编排（它本来就承担装配职责），view 只负责挂到正确位置。
+     *
+     * @param {Element} el
+     */
+    function attachTtsBar(el) {
+      if (!session || !el) return false;
+      session.ttsBar = el;
+      // 追加到最后 → 在所有 absolute 浮层里绘制在最上层
+      // （同 z-index 时后者在上；样式里另给了 z-index:3 双保险）。
+      session.shadow.appendChild(el);
+      syncScrollInset();
+      return true;
+    }
+
+    /** 移除朗读播放条。 */
+    function detachTtsBar() {
+      if (!session) return;
+      const el = session.ttsBar;
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      session.ttsBar = null;
+      syncScrollInset();
+    }
+
     return {
       isOpen,
       open,
@@ -462,8 +552,15 @@
       appendArticle,
       setStatus,
       onScrollNearBottom,
+      highlightBlock,
+      scrollToBlock,
+      attachTtsBar,
+      detachTtsBar,
+      /** 重算滚动留白（播放条显隐后需要）。 */
+      refreshInset: () => syncScrollInset(),
       getContent: () => (session ? session.content : null),
       getScroll: () => (session ? session.scroll : null),
+      getShadow: () => (session ? session.shadow : null),
       HOST_ID,
     };
   }

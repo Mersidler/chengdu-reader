@@ -62,8 +62,18 @@ const CONTENT_SCRIPTS = [
   "src/content/styles.js",
   "src/content/toolbar.js",
   "src/content/auto-next.js",
+  "src/content/tts-text.js",
+  "src/content/tts-bar.js",
+  "src/content/tts.js",
   "src/content/reader-view.js",
   "src/content/main.js",
+];
+
+/** content script 里所有应挂上 globalThis 的模块名（供探针与诊断使用）。 */
+const MODULE_NAMES = [
+  "Readability", "CleanDomUtils", "CleanBlank", "ReaderExtract",
+  "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "AutoNext",
+  "TtsText", "TtsBar", "ReaderTts", "ReaderView",
 ];
 
 /**
@@ -87,7 +97,10 @@ function tryToggle(tabId, force) {
   return api.scripting
     .executeScript({
       target: { tabId },
-      func: async (f) => {
+      // func 序列化后注入页面执行，读不到 background 的闭包变量，
+      // 因此模块名列表必须通过 args 传入（详见 probeGlobals 的说明）。
+      args: [force === undefined ? null : force, MODULE_NAMES],
+      func: async (f, names) => {
         // 注意：content script 的 isolated world 里 window !== globalThis，
         // 模块与 __reader 挂在 globalThis 上。两处都查一遍以增强兼容。
         const G = typeof globalThis !== "undefined" ? globalThis : window;
@@ -102,17 +115,10 @@ function tryToggle(tabId, force) {
               readerLoaded: Boolean(G.__readerLoaded),
               readerLoadError: G.__readerLoadError || null,
               // 逐个检查模块是否挂上了全局（globalThis 为准）
-              modules: {
-                Readability: typeof G.Readability,
-                CleanDomUtils: typeof G.CleanDomUtils,
-                CleanBlank: typeof G.CleanBlank,
-                ReaderExtract: typeof G.ReaderExtract,
-                ReaderPrefs: typeof G.ReaderPrefs,
-                ReaderStyles: typeof G.ReaderStyles,
-                ReaderToolbar: typeof G.ReaderToolbar,
-                AutoNext: typeof G.AutoNext,
-                ReaderView: typeof G.ReaderView,
-              },
+              modules: names.reduce((acc, n) => {
+                acc[n] = typeof G[n];
+                return acc;
+              }, {}),
             },
           };
         }
@@ -127,7 +133,6 @@ function tryToggle(tabId, force) {
           };
         }
       },
-      args: [force === undefined ? null : force],
     })
     .then((results) => {
       const first = Array.isArray(results) ? results[0] : null;
@@ -175,11 +180,11 @@ function probeGlobals(tabId) {
   return api.scripting
     .executeScript({
       target: { tabId },
-      func: () => {
-        const names = [
-          "Readability", "CleanDomUtils", "CleanBlank", "ReaderExtract",
-          "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "AutoNext", "ReaderView",
-        ];
+      // 注意：func 会被序列化后注入页面执行，**看不到 background 的闭包变量**，
+      // 因此模块名列表必须通过 args 传进去（曾直接把 MODULE_NAMES 写进 func，
+      // 在 background 里能读到、注入后必然 ReferenceError）。
+      args: [MODULE_NAMES],
+      func: (names) => {
         const G = typeof globalThis !== "undefined" ? globalThis : window;
         const onWindow = {};
         const onGlobalThis = {};
@@ -498,12 +503,166 @@ function registerMessageHandler() {
   console.log(`${LOG_PREFIX} 抓取消息处理器已注册（主世界优先，background 兜底）`);
 }
 
+// ---------------------------------------------------------------- TTS 合成
+
+/**
+ * 小米 MiMo TTS 接口配置。
+ *
+ * ## 为什么走 OpenAI 兼容的 /chat/completions 而不是 /audio/speech
+ *
+ * 实测（2026-09）该服务**没有** `/v1/audio/speech` 端点（404），
+ * TTS 是通过 chat/completions 的 audio 参数实现的：
+ *
+ *   POST https://api.xiaomimimo.com/v1/chat/completions
+ *   { model: "mimo-v2.5-tts",
+ *     messages: [ {role:"user", content:"请朗读。"},
+ *                 {role:"assistant", content:"<要朗读的文本>"} ],
+ *     audio: { voice: "茉莉", format: "mp3" } }
+ *
+ * 返回：choices[0].message.audio.data —— **base64 编码的音频**。
+ *
+ * ## 两个实测踩过的坑
+ *
+ * 1. **messages 必须含 assistant role**，否则报
+ *    `messages must contain an assistant role for TTS model`。
+ *    要朗读的文本放在 assistant 的 content 里（语义上就是「让模型说出这句」）。
+ *
+ * 2. **音色名是中文/特定字符串**，不是 OpenAI 的 alloy/nova 之类。
+ *    实测可用：mimo_default、冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean。
+ *    传错会返回 `Unknown voice: xxx. Available voices: [...]`。
+ *
+ * ## 为什么在 background 里请求
+ *
+ * content script 的 origin 是 moz-extension://，对 api.xiaomimimo.com 而言是跨源，
+ * 且 host_permissions 对 content script 无效（见 main.js 的说明）。
+ * 只有 background 具备跨源特权（manifest 已声明 http/https 的 host 权限）。
+ */
+const TTS_ENDPOINT = "https://api.xiaomimimo.com/v1/chat/completions";
+const TTS_MODEL = "mimo-v2.5-tts";
+const TTS_DEFAULT_VOICE = "茉莉";
+const TTS_DEFAULT_FORMAT = "mp3";
+const TTS_SUPPORTED_VOICES = ["mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"];
+const TTS_SUPPORTED_FORMATS = ["mp3", "wav", "pcm", "pcm16"];
+/** 单次合成的文本上限（字符）。超长会显著拉长单次等待，且失败代价高。 */
+const TTS_MAX_CHARS = 2000;
+
+/**
+ * 合成一段文本为音频。
+ *
+ * @param {object} req { text, apiKey, voice, format, speed? }
+ * @returns {Promise<{ok:true, audio:string, format:string}
+ *                  |{ok:false, reason:string, message?:string, status?:number}>}
+ */
+async function synthesizeSpeech(req) {
+  const text = String((req && req.text) || "").trim();
+  const apiKey = String((req && req.apiKey) || "").trim();
+
+  if (!text) return { ok: false, reason: "empty-text" };
+  if (!apiKey) return { ok: false, reason: "no-api-key" };
+  if (text.length > TTS_MAX_CHARS) return { ok: false, reason: "too-long", message: `文本超过 ${TTS_MAX_CHARS} 字` };
+
+  const voice = TTS_SUPPORTED_VOICES.indexOf(req && req.voice) >= 0 ? req.voice : TTS_DEFAULT_VOICE;
+  const format = TTS_SUPPORTED_FORMATS.indexOf(req && req.format) >= 0 ? req.format : TTS_DEFAULT_FORMAT;
+
+  const payload = {
+    model: TTS_MODEL,
+    messages: [
+      // user 是「指令」，assistant 才是「要朗读的文本」——实测的接口约定。
+      { role: "user", content: "请朗读下面这段话。" },
+      { role: "assistant", content: text },
+    ],
+    audio: { voice: voice, format: format },
+  };
+
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  // 生成耗时 ≈ 2.8s + 0.14s/字，2000 字约 285 秒，留足余量。
+  const limitMs = Math.max(30000, 15000 + text.length * 200);
+  const timer = controller ? setTimeout(() => controller.abort(), limitMs) : null;
+
+  try {
+    const res = await fetch(TTS_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(payload),
+      signal: controller ? controller.signal : undefined,
+    });
+
+    if (!res.ok) {
+      // 错误响应是 JSON（含 code/message/param），带回来便于用户定位
+      let detail = "";
+      try {
+        const errJson = await res.json();
+        detail = (errJson && errJson.error && (errJson.error.param || errJson.error.message)) || "";
+      } catch (_) {
+        /* 非 JSON 响应，忽略 */
+      }
+      return { ok: false, reason: "http-error", status: res.status, message: detail };
+    }
+
+    const json = await res.json();
+    const audio = json && json.choices && json.choices[0]
+      && json.choices[0].message && json.choices[0].message.audio;
+    if (!audio || !audio.data) {
+      return { ok: false, reason: "no-audio", message: "响应里没有音频数据" };
+    }
+    return { ok: true, audio: audio.data, format: format, chars: text.length };
+  } catch (err) {
+    const aborted = err && err.name === "AbortError";
+    return {
+      ok: false,
+      reason: aborted ? "timeout" : "network-error",
+      message: String((err && err.message) || err),
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 处理来自 content script 的 TTS 合成请求。
+ *
+ * 与 cd-fetch-page 分开成独立 type：两者的语义、超时、错误处理都不同，
+ * 混在一个分支里会让「抓页面失败」和「合成失败」的日志难以区分。
+ */
+function registerTtsHandler() {
+  if (!api.runtime || !api.runtime.onMessage) return;
+
+  api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!message || message.type !== "cd-tts-synth") return undefined;
+
+    const chars = String(message.text || "").length;
+    console.log(`${LOG_PREFIX} 收到 TTS 合成请求（${chars} 字，音色 ${message.voice || TTS_DEFAULT_VOICE}）`);
+
+    synthesizeSpeech(message)
+      .then((result) => {
+        if (result.ok) {
+          console.log(`${LOG_PREFIX} TTS 合成成功（${chars} 字，base64 ${result.audio.length} 字符）`);
+        } else {
+          console.warn(`${LOG_PREFIX} TTS 合成失败：${result.reason}${result.message ? " - " + result.message : ""}`);
+        }
+        sendResponse(result);
+      })
+      .catch((err) => {
+        console.error(`${LOG_PREFIX} TTS 合成异常`, err);
+        sendResponse({ ok: false, reason: "exception", message: String((err && err.message) || err) });
+      });
+
+    return true; // 保持通道打开等待异步响应
+  });
+
+  console.log(`${LOG_PREFIX} TTS 消息处理器已注册`);
+}
+
 // ---------------------------------------------------------------- 事件绑定
 
 // 注：manifest 中不能给 action 配 default_popup，否则 onClicked 不会触发。
 api.action.onClicked.addListener(toggleReader);
 
 registerMessageHandler();
+registerTtsHandler();
 
 api.commands.onCommand.addListener((command) => {
   console.log(`${LOG_PREFIX} 收到快捷键命令：${command}`);

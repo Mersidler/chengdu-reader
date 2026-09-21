@@ -412,7 +412,150 @@ function buildCss(prefs) {
 .rd-bar .rd-close { margin-inline-start: .2em; }
 .rd-bar .rd-num { min-width: 2.4em; text-align: center; color: ${t.muted}; font-variant-numeric: tabular-nums; }
 
-/* 小屏：工具条贴底，避免遮挡标题。 */
+/* --------------------------------------------------------- 朗读播放条 */
+/* 与 .rd-status 同理：它是 shadow root 的直接子元素（在滚动容器之外），
+   因此这里的 absolute 相对宿主（:host 全屏）定位，能真正固定在视口底部。
+   若放进滚动容器内部，会随内容滚动、bottom:0 指向内容底部。 */
+.rd-tts-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: .15rem;
+  padding: .42rem .6rem;
+  background: ${t.barBg};
+  border-top: 1px solid ${t.barBorder};
+  backdrop-filter: blur(10px);
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  color: ${t.fg};
+}
+.rd-tts-bar button {
+  all: unset;
+  cursor: pointer;
+  padding: .42em .6em;
+  border-radius: 999px;
+  color: ${t.fg};
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: .3em;
+}
+.rd-tts-bar button:hover { background: ${t.barHover}; }
+.rd-tts-bar button:focus-visible { outline: 2px solid ${t.link}; outline-offset: 1px; }
+/* 禁用态：降低不透明度并禁止指针事件，给出「现在不能用」的明确反馈 */
+.rd-tts-bar button:disabled { opacity: .35; cursor: default; }
+.rd-tts-bar button:disabled:hover { background: transparent; }
+/* 主按钮（播放/暂停）加大一点，便于点击 */
+.rd-tts-bar .rd-tts-toggle {
+  min-width: 2.2em;
+  justify-content: center;
+  background: ${t.barHover};
+  font-weight: 600;
+}
+/* 合成中：脉动提示，避免用户以为「点了没反应」 */
+.rd-tts-bar[data-state="buffering"] .rd-tts-toggle {
+  animation: rd-pulse 1.1s ease-in-out infinite;
+}
+.rd-tts-bar .rd-tts-sep {
+  width: 1px;
+  height: 1.15em;
+  background: ${t.barBorder};
+  margin-inline: .3em;
+  flex: none;
+}
+.rd-tts-bar .rd-tts-num {
+  min-width: 2.6em;
+  text-align: center;
+  color: ${t.muted};
+  font-variant-numeric: tabular-nums;
+}
+.rd-tts-bar .rd-tts-info {
+  color: ${t.muted};
+  padding-inline: .35em;
+  max-width: 22em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.rd-tts-bar .rd-tts-close { margin-inline-start: .2em; }
+/* API Key 输入框：填一次即持久化。宽度按 key 长度给足，便于核对粘贴内容。 */
+.rd-tts-bar .rd-tts-key {
+  all: unset;
+  width: 11em;
+  padding: .42em .6em;
+  border-radius: 999px;
+  color: ${t.fg};
+  font-size: 12px;
+  line-height: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: ${t.codeBg};
+  border: 1px solid ${t.barBorder};
+}
+.rd-tts-bar .rd-tts-key:focus-visible { outline: 2px solid ${t.link}; outline-offset: 1px; }
+/* 未填写时描红：让「为什么点了没声音」在界面上直接可见 */
+.rd-tts-bar .rd-tts-key[data-missing="true"] { border-color: #d9534f; }
+.rd-tts-bar .rd-tts-key::placeholder { color: ${t.muted}; }
+/* 下拉选择器：用 appearance:none 去掉原生外观后自己画，才能跟主题一致。
+   注意不能设 display:none，否则会被 styles.test 的隐藏白名单拦下。 */
+.rd-tts-bar .rd-tts-select {
+  all: unset;
+  cursor: pointer;
+  padding: .42em 1.4em .42em .6em;
+  border-radius: 999px;
+  color: ${t.fg};
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+  background-image: linear-gradient(45deg, transparent 50%, ${t.muted} 50%),
+                    linear-gradient(135deg, ${t.muted} 50%, transparent 50%);
+  background-position: calc(100% - .85em) 52%, calc(100% - .6em) 52%;
+  background-size: .28em .28em, .28em .28em;
+  background-repeat: no-repeat;
+}
+.rd-tts-bar .rd-tts-select:hover { background-color: ${t.barHover}; }
+.rd-tts-bar .rd-tts-select:focus-visible { outline: 2px solid ${t.link}; outline-offset: 1px; }
+/* 下拉展开后的 option 在部分浏览器里不继承 shadow 样式，
+   显式给出前景/背景色，避免深色主题下白底白字。 */
+.rd-tts-bar .rd-tts-select option {
+  color: ${t.fg};
+  background: ${t.bg};
+}
+
+/* 正在朗读的段落高亮。
+   用 box-shadow 而不是 outline：outline 在跨行内联元素上表现不一，
+   而段落是块级元素、box-shadow 更可控，且不影响布局（不引起回流）。 */
+.rd-tts-active {
+  box-shadow: 0 0 0 .18em ${t.selBg};
+  border-radius: .2em;
+  transition: box-shadow .2s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rd-tts-active { transition: none; }
+  .rd-tts-bar[data-state="buffering"] .rd-tts-toggle { animation: none; opacity: 1; }
+}
+
+/* 小屏：播放条控件多，允许横向滚动而不是撑高遮挡正文 */
+@media (max-width: 640px) {
+  .rd-tts-bar {
+    justify-content: flex-start;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    font-size: 12px;
+  }
+  .rd-tts-bar .rd-tts-info { max-width: 9em; }
+}
+
+/* 小屏时工具条贴底 */
 @media (max-width: 640px) {
   .rd-bar { top: auto; bottom: .8rem; }
   .rd-scroll { padding-top: 2rem; }

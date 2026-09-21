@@ -91,6 +91,49 @@ Word 粘贴的富文本里非常常见。
 | **主世界抓取** | Cloudflare 等防护挑战扩展请求（详见下文「关键设计」） |
 | 三级降级 | 主世界 → background → 真实导航，尽可能保住连续阅读 |
 
+**有声朗读（听书）**（工具条上开关，默认关闭）
+
+把正文用小米 MiMo TTS 合成语音朗读，读到本章将尽时自动续下一章——全程不用手动干预。
+
+- **两种合成粒度**（播放条上一键切换）
+  - `分段`（默认）：首句出声快（约 3 秒），段间语气可能有细微跳变
+  - `整页`：整页一次合成，语气连贯，但首次出声慢
+- **播放控制**：播放/暂停、上一段/下一段、语速（0.75×~2×）、音色、进度显示
+- **9 个音色**：茉莉 / 冰糖 / 苏打 / 白桦（中文），Mia / Chloe / Milo / Dean / 默认（英文）
+- **视图跟随**：朗读到哪，视图滚到哪，当前段落高亮
+- **进度记忆**：按页面记住读到第几段，下次打开该页可继续
+
+### 自动续章是怎么做到「提前」的（这是听书的关键难点）
+
+不需要用滚动位置去猜「本章快读完了」——**播放引擎自己精确知道还剩多少音频**：
+
+```
+正文块 → 切分成 cue → 合成队列（并发 2，保持领先）→ 音频队列 → 顺序播放
+                          ↑                                  │
+                          └── 剩余可播时长 < 90 秒 → 触发续章 ┘
+```
+
+- **触发条件是播放水位**，比滚动像素精确得多，且天然带提前量
+- 续章调用的是自动续页已有的 `prefetch()` 缓存——用户还在读当前章时，
+  下一章早已抓取、解析、净化完毕，**命中缓存即零等待**
+- 朗读时不滚动页面，所以「滚动到底自动加载」不会触发；改由引擎按水位驱动
+
+### 朗读的已知限制
+
+- **需要自备 API Key**：在底部播放条填入小米 MiMo 开放平台的 Key（`sk-` 开头）。
+  **填一次即可**——输入框实时同步到 `storage.local`，下次打开自动回填，
+  不需要重新填写。Key 只存在本地，不上传任何地方；**代码里不硬编码任何密钥**。
+  在输入框里按回车可直接开始播放。
+- **语速 > 1.5× 时音调会变尖**：Web Audio 的 `playbackRate` 会同时改变音调，
+  原生没有「变速不变调」。1.0× 无影响
+- **首次播放需点一下**：浏览器要求 `AudioContext` 在用户手势的**同步执行栈**里
+  创建或 `resume()`。这是有意的设计——引擎在点击处理器里同步调用
+  `primeAudio()`，而不是等网络请求回来再创建（那时手势已失效，
+  音频上下文会一直是 `suspended`，表现为「合成成功但完全没声音」，
+  且 `onended` 永不触发、朗读会卡在第一条不动）
+- **降级导航场景会中断朗读**：站点抓取被 Cloudflare 拦下时会改为真实导航跳页，
+  新页面无用户手势、浏览器不允许自动出声。进度记忆保证跳过去后能从原处继续
+
 **不做**（本版有意排除）：标注高亮、笔记、导出、目录、图片增强。
 
 ---
@@ -125,7 +168,7 @@ Firefox 对扩展有**强制签名**要求：
 这是唯一能让扩展在正式版 Firefox 里**永久安装**的途径。
 
 ```bash
-npm run build          # 生成 dist/chengdu-reader-0.1.0.zip
+npm run build          # 生成 dist/chengdu-reader-0.2.0.zip
 ```
 
 然后在 [addons.mozilla.org/developers](https://addons.mozilla.org/developers/) 提交审核，
@@ -158,12 +201,19 @@ Firefox **140+**。选择这个下限的原因：
 
 ```bash
 npm run start     # 自动启动 Firefox 并载入扩展（需已安装 Firefox，最方便）
-npm run build     # 打包为 dist/chengdu-reader-0.1.0.zip
+npm run build     # 打包为 dist/chengdu-reader-0.2.0.zip
 npm run lint      # 清单与代码校验
 ```
 
 `npm run start` 是用 `web-ext run` 启动一个已载入扩展的 Firefox，
 改完代码自动重载，比手动临时载入省事。
+
+> **`npm run start` 用了持久 profile（重要）**：`web-ext run` 默认每次创建
+> **全新的临时 profile**（官方文档：*"If not specified, a new temporary profile
+> will be created"*），而扩展的 `storage.local` 存在 profile 里——
+> 于是每次启动你的**设置和 API Key 都被清空**，表现为「每次都要重新填 key」。
+> 因此 `start` 脚本显式指定了 `--firefox-profile .web-ext-profile
+> --keep-profile-changes`，设置会被保留（该目录已 gitignore）。
 
 ---
 
@@ -171,10 +221,10 @@ npm run lint      # 清单与代码校验
 
 ```bash
 npm install          # 安装 jsdom（仅测试用）
-npm test             # 跑全部测试（209 项）
+npm test             # 跑全部测试（292 项）
 npm run lint         # web-ext 清单校验
 npm run start        # 启动带扩展的 Firefox（需已安装 Firefox）
-npm run build        # 打包为 dist/chengdu-reader-0.1.0.zip
+npm run build        # 打包为 dist/chengdu-reader-0.2.0.zip
 npm run vendor       # 重新拉取并打包 Readability（一般不需要）
 ```
 
@@ -192,10 +242,13 @@ src/
     main.js                       # 入口：注入守卫 + 编排 + 自动续页装配 + 跨页恢复
     extract.js                    # 克隆文档 → Readability → 净化 → 清理；下一页链接识别
     auto-next.js                  # ★ 自动续页控制器（预加载 / 去重 / 冷却 / 并发防护）
+    tts-text.js                   # ★ 朗读文本切分（切句 / 增量扫描 / 两种粒度打包）
+    tts.js                        # ★ 朗读引擎（合成队列 / Web Audio 播放 / 水位续章）
+    tts-bar.js                    # 底部朗读播放条（播放控制 / 语速 / 音色 / 粒度 / Key）
     reader-view.js                # Shadow DOM 浮层、生命周期、追加内容、状态提示
     toolbar.js                    # 浮动工具条
     prefs.js                      # 偏好读写（storage.local）
-    styles.js                     # 阅读视图样式（含 CSS 兜底层、章节分隔、状态条）
+    styles.js                     # 阅读视图样式（含 CSS 兜底层、章节分隔、状态条、播放条）
     clean/
       dom-utils.js                # DOM 判定工具 + 安全净化
       clean-blank.js              # ★ 空行清理管线（8 步）
@@ -206,8 +259,11 @@ tests/
   sanitize.test.mjs               # 安全净化测试
   title.test.mjs                  # 标题处理测试
   auto-next.test.mjs              # ★ 自动续页：链接识别 / 预加载 / 防死循环 / 编码 / 降级
+  tts-text.test.mjs               # ★ 朗读切分：切句 / 增量扫描一致性 / 不跨章打包
+  tts.test.mjs                    # ★ 朗读引擎：状态机 / 水位续章 / 高亮 / 进度记忆
+  tts-bar.test.mjs                # ★ 播放条 UI：API Key 持久化 / 回车提交 / 阻止冒泡
   reader-view.test.mjs            # 视图/工具条/偏好 DOM 测试
-  background.test.mjs             # background 注入与抓取转发逻辑
+  background.test.mjs             # background 注入与抓取/TTS 转发逻辑
   load-order.test.mjs             # 脚本加载顺序 + 端到端
   global-object.test.mjs          # ★ window !== globalThis 的真实环境差异
   shortcut.test.mjs               # 快捷键与权限配置守卫
@@ -216,6 +272,10 @@ tests/
   devtools/
     dirty-page.html               # 「脏页面」样本（空行清理）
     dev-server.cjs                # 本地测试服务器（小说站 + 脏页面 + 源码）
+    verify-tts.html               # ★ 真机验证页：decodeAudioData 解码真实 MP3
+    verify-collector.cjs          # 收集真机验证结果（headless 无法截图时的取数方式）
+    verify-e2e.cjs                # ★ TTS 端到端验证（真实 API，含长文本完整性）
+    sample-tts.mp3                # 真实 TTS 音频样本（真机解码验证用）
 tools/vendor-readability.mjs      # Readability 拉取打包脚本
 ```
 
@@ -310,6 +370,31 @@ jsdom 里两者是同一个对象，**所以单元测试测不出这个差异**�
 藏了很久。现在失败会在工具栏图标上显示红色角标（`!` 权限 / `×` 其他），
 并把关键步骤写进日志——`console.log` 成本极低，但能把静默失败变成可诊断的失败。
 
+**朗读为什么走 background 而不是内容脚本直连。** 与抓取同理：content script 的
+origin 是 `moz-extension://`，对 `api.xiaomimimo.com` 而言是跨源，而
+`host_permissions` 对 content script 无效。只有 background 有跨域特权。
+
+（顺带一提：官方 API 确实返回 `Access-Control-Allow-Origin: *`，
+所以内容脚本直连也能通——但依赖服务端的 CORS 配置是脆弱的，
+一旦对方收紧就会静默失效。走 background 不依赖这个假设。）
+
+**朗读为什么用 Web Audio 而不是 `<audio>`。** `<audio src="blob:...">` 是页面文档里的
+媒体元素，受页面 CSP 的 `media-src` 约束（本项目在 CSP 上栽过跟头）。
+`AudioContext.decodeAudioData` 走纯 JS 数据路径，不受 CSP 约束。
+
+**朗读的切分为什么必须增量。** 自动续页会在用户阅读过程中不断往正文追加内容。
+如果每次追加都重新打包整份 cue 列表，**已经合成好的 cue 会因重新切分而错位**——
+缓存的音频对不上文本，朗读内容会串。因此打包器设计成增量的：
+一旦某个 cue 被吐出，它的文本与下标永不改变，新内容只会追加成新 cue。
+`tests/tts-text.test.mjs` 有专门的断言守住这条不变式。
+
+**朗读的 cue 为什么不跨章节边界。** 跨章拼接会让语气在接缝处突变，
+且高亮定位失去意义。用「遇到章节分隔线就切换 pageIndex」作为分组键自然阻断。
+
+**朗读引擎顶层绝不触碰 `AudioContext`。** jsdom 里没有这个 API，
+若在模块加载时就 `new AudioContext()`，所有加载该模块的测试都会崩。
+因此一律惰性创建 + `typeof` 守卫。
+
 ---
 
 ## 测试
@@ -330,11 +415,15 @@ npm test
 - **加载**：按 manifest 顺序注入后全局变量链完整、端到端可开合
 - **样式守卫**：禁止会把正常段落隐藏的选择器（见下）
 - **语法守卫**：所有脚本通过语法检查、CSS 模板字符串完整
+- **朗读切分**：切句正确性、增量扫描与一次性全扫结果一致、重复扫描幂等、
+  已吐出的 cue 下标与文本永不改变、一个 cue 不跨章节
+- **朗读引擎**：状态机迁移、并发受限、合成失败跳过而非卡死、
+  水位触发续章、续章后扫描到新内容、高亮与跟随、进度记忆、无 `AudioContext` 环境不崩
 
-### 两个「只有真实浏览器能发现」的坑
+### 三类「只有真实环境能发现」的坑
 
-jsdom 不做布局、也不支持 `:has()`，因此有两类 bug 单靠单元测试测不出来，
-已在代码与测试中留下防线：
+jsdom 不做布局、不支持 `:has()`、没有 `AudioContext`、也不发真实网络请求，
+因此有三类 bug 单靠单元测试测不出来，已在代码与测试中留下防线：
 
 1. **样式误伤正文**：曾写下 `p:not(:has(*)):not(:empty) { display: none }`，
    它的实际含义是「有文字但没有嵌套元素的段落」——把几乎所有正文段落都隐藏了。
@@ -342,15 +431,41 @@ jsdom 不做布局、也不支持 `:has()`，因此有两类 bug 单靠单元测
 2. **绝对定位居中导致换行**：`.rd-bar` 曾用 `left:50% + translateX(-50%)` 居中，
    绝对定位元素在宽度 auto 时的可收缩宽度只有「左边界→右边缘」= 半屏，
    工具条因此被迫换行、并遮住标题。现已改为 `inset-inline:0 + margin:auto + fit-content`。
+3. **音频解码能力**：`decodeAudioData` 能否解码服务端返回的音频，jsdom 完全测不了。
+   用 `tests/devtools/verify-tts.html` 在**真实 Firefox** 里验证过：
+   官方 API 的 MP3 可正常解码（3.04 秒 / 48000Hz / 单声道），
+   音频有实际内容（峰值 0.508），时长与文本长度相符。
 
 **建议改动样式后，用 `tests/devtools/dirty-page.html` 在真实浏览器里过一眼。**
+
+### 朗读的两套验证
+
+| 脚本 | 验证什么 | 需要什么 |
+|---|---|---|
+| `tests/devtools/verify-tts.html` | 真实浏览器里的音频解码与播放链路 | 一个静态服务器 + 真实 Firefox |
+| `tests/devtools/verify-e2e.cjs` | 真实 API 的端到端（含长文本完整性、各音色、各格式） | API Key（`MIMO_API_KEY` 或 `.tts-key`） |
+
+`verify-e2e.cjs` 实测结论（2026-09）：1134 字 → **502 秒音频 / 3.2MB，MP3 帧连续无截断**；
+5 个中文音色全部可用；非法音色会返回可读错误。
+
+> 注：`verify-collector.cjs` 是配合 `verify-tts.html` 的取数工具。
+> 本机 Firefox headless 的 `--screenshot` 会失败（GFX1 错误），
+> 而它的远程调试端口走 WebDriver BiDi（不是 CDP），从 Node 侧读取不便，
+> 因此让验证页把结果 **POST 回收集器**是最可靠的取数方式。
 
 ---
 
 ## 隐私
 
-不收集、不传输任何数据。所有偏好只存在本地 `browser.storage.local`，
-正文处理完全在页面内完成，无任何网络请求。
+**阅读模式本身**：不收集、不传输任何数据。所有偏好只存在本地 `browser.storage.local`，
+正文提取与清理完全在页面内完成，无任何网络请求。
+
+**有声朗读**：只在**你主动开启朗读并填写 API Key** 后，才把**待朗读的正文文本**
+发送到小米 MiMo 的语音合成接口（`api.xiaomimimo.com`）以换取音频。
+这是朗读功能的必要前提，除此之外不发送任何内容（不发送页面 URL、
+不发送 Cookie、不发送任何标识信息）。API Key 只存在本地 `storage.local`，
+代码里不硬编码任何密钥。**不使用朗读功能则完全没有这类请求。**
+
 清单中据此声明 `data_collection_permissions.required = ["none"]`。
 
 ---

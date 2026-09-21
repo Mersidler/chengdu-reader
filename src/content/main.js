@@ -35,7 +35,8 @@
     if (typeof window !== "undefined" && window !== G) {
       for (const name of [
         "Readability", "CleanDomUtils", "CleanBlank", "ReaderExtract",
-        "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "AutoNext", "ReaderView",
+        "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "AutoNext",
+        "TtsText", "TtsBar", "ReaderTts", "ReaderView",
       ]) {
         if (G[name] === undefined && window[name] !== undefined) G[name] = window[name];
       }
@@ -73,6 +74,9 @@
     "ReaderStyles",
     "ReaderToolbar",
     "AutoNext",
+    "TtsText",
+    "TtsBar",
+    "ReaderTts",
     "ReaderView",
   ];
   const missing = REQUIRED.filter((name) => !G[name]);
@@ -84,7 +88,6 @@
   }
 
   const { ReaderExtract, ReaderView, ReaderToolbar, ReaderPrefs } = G;
-
   /** 已加载的偏好（进入阅读模式前先取一次）。 */
   const prefs = Object.assign({}, ReaderPrefs.DEFAULTS);
 
@@ -128,6 +131,9 @@
     // 切换「空行清理」开关后，需要重新提取一次正文才能看到差异。
     onToggleClean: () => {
       if (!view.isOpen()) return;
+      // 重新提取会重建整个视图 → 朗读必须一并拆掉（否则音频会继续播，
+      // 而它引用的段落节点已经不在文档里了）。
+      teardownTts();
       teardownAutoNext();
       view.close();
       // 立即写盘一次，避免防抖窗口内用户就离开了页面。
@@ -138,6 +144,16 @@
     // 自动续页开关：即时生效，不需要重新提取。
     onToggleAutoNext: (enabled) => {
       autoNext.setEnabled(enabled);
+    },
+    // 有声朗读开关：即时生效。打开则建播放条并开始朗读，关闭则拆除。
+    onToggleTts: (enabled) => {
+      if (!enabled) {
+        teardownTts();
+        return;
+      }
+      // 先建播放条（这样即使没有 key，用户也能看到输入框并知道该填什么）
+      if (!tts) setupTts();
+      startTts().catch(() => {});
     },
   });
 
@@ -232,8 +248,13 @@
     // 三级降级：同源抓取 → background 抓取 → 真实导航（见 fetchPageSmart）
     fetchPage: fetchPageSmart,
     parseArticle: parseFetchedPage,
-    appendArticle: (article) => view.appendArticle(article),
-    onStatus: (status) => view.setStatus(status),
+    appendArticle: (article) => {
+      view.appendArticle(article);
+      // 追加了新内容 → 通知朗读引擎扫描（它按子元素游标增量取新块）。
+      // 放在这里而不是让引擎自己轮询，是因为只有此处知道「刚好有新内容」。
+      if (tts) tts.scan();
+    },
+    onStatus: forwardStatus,
     // 降级路径：抓取被 Cloudflare 等防护拦下时，改用真实浏览器导航。
     // 真实导航带完整浏览器指纹，会被正常放行（相当于用户手点「下一章」）。
     // 页面加载后由 main.js 检测「阅读模式待恢复」标记，自动重新进入阅读模式。
@@ -297,6 +318,186 @@
   /** 滚动监听退订函数（每次打开阅读模式重新绑定）。 */
   let scrollUnsub = null;
 
+  // ------------------------------------------------------------ 有声朗读
+
+  /**
+   * 朗读引擎与播放条实例（打开阅读模式时创建，关闭时销毁）。
+   *
+   * 生命周期与 autoNext 不同：autoNext 是常驻单例（reset 复用），
+   * 而朗读依赖视图的 content/scroll 元素，视图一关这些元素就没了，
+   * 因此每次打开重新创建、关闭时彻底销毁（含关闭 AudioContext）。
+   */
+  let tts = null;
+  let ttsBar = null;
+
+  /**
+   * 自动续页的状态在 TTS 激活时要改道。
+   *
+   * 为什么：autoNext 的 onStatus 原本直接送 view.setStatus（底部提示条）。
+   * 但朗读时用户不滚动，滚动触发的 maybeLoadNext 不会发生——改由 TTS
+   * 引擎按播放水位调用。此时状态提示应显示在播放条上（用户正在看的地方），
+   * 而不是底部状态条（会和播放条叠在一起）。
+   */
+  function forwardStatus(status) {
+    if (tts && ttsBar) {
+      // 朗读中：把续页状态合并进播放条文案，不再占用底部状态条
+      if (status && (status.state === "loading" || status.state === "error")) {
+        ttsBar.setMessage(status.message || (status.state === "loading" ? "正在加载下一章…" : "加载失败"));
+      }
+      return;
+    }
+    view.setStatus(status);
+  }
+
+  /** 创建并装配朗读（在 view.open 之后调用）。 */
+  function setupTts() {
+    if (!G.ReaderTts || !G.TtsBar || !G.TtsText) return;
+
+    tts = G.ReaderTts.createTts({
+      text: G.TtsText,
+      getContent: () => view.getContent(),
+      getTitle: () => {
+        // 视图标题在 .rd-title 里；取不到时回退到文章标题
+        const shadow = view.getShadow();
+        const el = shadow ? shadow.querySelector(".rd-title") : null;
+        return (el && el.textContent) || "";
+      },
+      onState: (status) => {
+        if (ttsBar) ttsBar.refresh(status);
+      },
+      onCueChange: () => {
+        if (ttsBar) ttsBar.refresh(tts.getState());
+      },
+      // 需要下一章时走 auto-next：它命中 prefetch 缓存时零等待，
+      // 这正是「提前取好下一章」的收益所在。
+      onNeedNext: () => autoNext.maybeLoadNext(),
+      highlight: (block, on) => view.highlightBlock(block, on),
+      scrollTo: (block) => view.scrollToBlock(block),
+      url: location.href,
+    });
+
+    tts.configure({
+      apiKey: prefs.ttsApiKey,
+      voice: prefs.ttsVoice,
+      rate: prefs.ttsRate,
+      mode: prefs.ttsGranularity,
+      autoNext: prefs.autoLoadNext,
+      resume: prefs.ttsResume,
+    });
+
+    ttsBar = G.TtsBar.create({
+      prefs: prefs,
+      onToggle: () => {
+        const st = tts.getState().state;
+        if (st === "playing" || st === "buffering") {
+          tts.pause();
+          return;
+        }
+        if (st === "paused") {
+          tts.resume();
+          return;
+        }
+        // idle / ended / error → 从头开始或重试。
+        //
+        // ★ 关键：primeAudio() 必须在这里**同步**调用（点击处理器的执行栈内）。
+        // 一旦进入 startTts() 的 await 之后，用户手势上下文就失效了，
+        // 音频上下文会保持 suspended → 表现为「合成成功但完全没声音」。
+        // 详见 tts.js 的 player.prime 说明。
+        tts.primeAudio();
+        startTts().catch(() => {});
+      },
+      // 输入框内容变化（含回车/失焦）→ 立即生效并持久化
+      onApiKey: (key) => {
+        prefs.ttsApiKey = key;
+        prefsDirty = true;
+        // 立即写盘（不防抖）：用户可能填完就关掉阅读模式，
+        // 防抖窗口内关闭会丢掉这次输入（实测踩过）。
+        ReaderPrefs.save(prefs).catch(() => {});
+        tts.configure({ apiKey: key });
+      },
+      // 在输入框按回车：填完 key 的自然动作就是「开始播」
+      onSubmitKey: () => {
+        tts.primeAudio(); // 同样必须在手势栈里同步解锁
+        startTts(true).catch(() => {});
+      },
+      onPrev: () => tts.prev(),
+      onNext: () => tts.next(),
+      onChange: (next) => {
+        // 播放条上的音色/语速/粒度改动：即时生效 + 持久化
+        prefsDirty = true;
+        Object.assign(prefs, next);
+        schedulePersist();
+        tts.configure({
+          voice: prefs.ttsVoice,
+          rate: prefs.ttsRate,
+          mode: prefs.ttsGranularity,
+          apiKey: prefs.ttsApiKey,
+        });
+      },
+      onClose: () => {
+        // ★ 先 flush 输入框：用户可能填完 key 直接点 ✕，
+        // 此时若还压在防抖窗口里这次输入就丢了（表现为「每次都要重填」）。
+        if (ttsBar && ttsBar.flushKey) ttsBar.flushKey();
+        prefs.ttsEnabled = false;
+        prefsDirty = true;
+        // 关闭前立即写盘：防抖窗口内关闭会丢掉刚填的 API Key。
+        ReaderPrefs.save(prefs).catch(() => {});
+        teardownTts();
+        if (G.ReaderToolbar && G.ReaderToolbar.refresh) G.ReaderToolbar.refresh(prefs);
+      },
+    });
+
+    view.attachTtsBar(ttsBar.element);
+    if (ttsBar.refresh) ttsBar.refresh(tts.getState());
+  }
+
+  /**
+   * 开始朗读（会先做 API Key 校验）。
+   *
+   * @param {boolean} [userGesture] 是否由用户手势直接触发。
+   *   用户点击时传 true，此时音频已在点击栈里被 prime 过。
+   *   自动恢复（进入阅读模式时）不是手势，传 false。
+   */
+  async function startTts(userGesture) {
+    if (!tts) return false;
+    tts.configure({
+      apiKey: prefs.ttsApiKey,
+      voice: prefs.ttsVoice,
+      rate: prefs.ttsRate,
+      mode: prefs.ttsGranularity,
+    });
+    if (!prefs.ttsApiKey) {
+      ttsBar.setMessage("请先填写 MiMo API Key");
+      toast("请先在底部播放条填入小米 MiMo 的 API Key（sk- 开头）");
+      return false;
+    }
+    // 手势触发时先同步解锁音频（必须在 await 之前）。
+    // 非手势（自动恢复）时 prime 通常无效，此时引擎的 play() 会返回 false
+    // 并给出「请再点一次播放」的可见提示，而不是静默无声。
+    if (userGesture) tts.primeAudio();
+    return await tts.start();
+  }
+
+  /** 拆除朗读（停止播放、关闭音频上下文、移除播放条）。 */
+  function teardownTts() {
+    // 先 flush 输入框，避免防抖窗口内的输入随拆卸一起丢失。
+    if (ttsBar && ttsBar.flushKey) {
+      try { ttsBar.flushKey(); } catch (_) { /* 忽略 */ }
+    }
+    if (tts) {
+      try {
+        tts.destroy();
+      } catch (_) {
+        /* 销毁失败不应阻塞关闭流程 */
+      }
+      tts = null;
+    }
+    if (ttsBar) {
+      view.detachTtsBar();
+      ttsBar = null;
+    }
+  }
+
   /** 为一个已打开的会话装配自动续页。 */
   function setupAutoNext(article) {
     autoNext.setCurrentUrl(location.href);
@@ -328,6 +529,9 @@
    * 之前有多个地方直接调 view.close()，新增清理项后很容易漏掉某一处。
    */
   function closeReader() {
+    // 朗读必须先拆：它持有 AudioContext 与在途的合成请求，
+    // 视图一关这些元素就没了，留着会继续出声或抛错。
+    teardownTts();
     teardownAutoNext();
     view.close();
   }
@@ -386,6 +590,15 @@
 
     // 装配自动续页（含滚动监听）。放在 open 之后：需要视图已就绪。
     setupAutoNext(result);
+
+    // 若用户上次开着朗读，进入阅读模式后自动恢复（需已有 API Key）。
+    // 注意：浏览器的自动播放策略要求 AudioContext 在用户手势中创建，
+    // 这里不是手势上下文，因此首次可能被拒——被拒时引擎会给出明确提示，
+    // 用户点一下播放按钮即可（那次是手势）。这是浏览器的硬约束，无法绕过。
+    if (prefs.ttsEnabled) {
+      setupTts();
+      startTts().catch(() => {});
+    }
 
     // 记录本次使用的清理开关，供下次进入时沿用。
     schedulePersist();

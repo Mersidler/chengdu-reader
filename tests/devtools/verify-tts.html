@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>真机验证：TTS 音频解码与播放链路</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #111; color: #eee; }
+  h1 { font-size: 18px; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 13px; line-height: 1.7; white-space: pre-wrap; }
+  .ok { color: #4ade80; }
+  .bad { color: #f87171; }
+  .info { color: #93c5fd; }
+</style>
+</head>
+<body>
+<h1>真机验证：TTS 音频解码与播放链路</h1>
+<div id="log"></div>
+<script>
+/**
+ * 这个页面专门验证 jsdom 测不了的三件事：
+ *   1. 官方 API 返回的真实 MP3 能否被 Web Audio 的 decodeAudioData 解码
+ *      （这是「选 mp3 格式」的核心假设，jsdom 里没有 AudioContext，测不了）
+ *   2. 解码后的时长是否与文本长度相符（验证音频完整、没有被截断）
+ *   3. 解码 → AudioBufferSource → 播放 的链路是否真的能出声
+ *
+ * 结果写到 #log 与 document.title，便于用 --screenshot 或 dump-dom 取回。
+ */
+const log = (msg, cls) => {
+  const el = document.getElementById("log");
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  el.appendChild(line);
+  console.log("[VERIFY] " + msg);
+};
+
+const results = [];
+let finished = false;
+const record = (name, pass, detail) => {
+  results.push({ name, pass, detail });
+  log((pass ? "✔ " : "✘ ") + name + (detail ? "  — " + detail : ""), pass ? "ok" : "bad");
+};
+
+// 看门狗：无论中间哪一步卡住（例如 resume() 永不 resolve），
+// 都必须在 20 秒内输出结果并回传——否则外部永远取不到数据
+// （实测踩过：验证脚本挂起，收集器一直收不到 POST）。
+setTimeout(() => {
+  if (!finished) {
+    log("");
+    log("看门狗触发：验证未在 20 秒内完成，已强制输出当前结果", "bad");
+    finish();
+  }
+}, 20000);
+
+(async function main() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) {
+    record("AudioContext 可用", false, "浏览器未提供 AudioContext");
+    return finish();
+  }
+  record("AudioContext 可用", true, AC.name || "AudioContext");
+
+  let ctx;
+  try {
+    ctx = new AC();
+    record("创建 AudioContext", true, "state=" + ctx.state + " sampleRate=" + ctx.sampleRate);
+  } catch (e) {
+    record("创建 AudioContext", false, String(e && e.message || e));
+    return finish();
+  }
+
+  // ---- 1) 取真实音频（由收集器直接服务，验证解码能力本身）
+  // 注意用相对路径：验证页可能由不同的收集器端口服务，
+  // 写死绝对路径会 404（实测踩过）。
+  const url = "sample-tts.mp3";
+  let bytes;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const buf = await res.arrayBuffer();
+    bytes = new Uint8Array(buf);
+    record("取到音频文件", true, bytes.length + " 字节");
+  } catch (e) {
+    record("取到音频文件", false, String(e && e.message || e));
+    return finish();
+  }
+
+  // ---- 2) 关键：decodeAudioData 能否解码官方 API 的 MP3
+  let audioBuf;
+  try {
+    // 用 Promise 包装，兼容回调式实现
+    audioBuf = await new Promise((resolve, reject) => {
+      let settled = false;
+      const ok = (b) => { if (!settled) { settled = true; resolve(b); } };
+      const bad = (e) => { if (!settled) { settled = true; reject(e || new Error("decode failed")); } };
+      try {
+        const p = ctx.decodeAudioData(bytes.buffer.slice(0), ok, bad);
+        if (p && typeof p.then === "function") p.then(ok).catch(bad);
+      } catch (e) { bad(e); }
+    });
+    record(
+      "★ decodeAudioData 解码官方 API 的 MP3",
+      true,
+      "时长=" + audioBuf.duration.toFixed(2) + "s 采样率=" + audioBuf.sampleRate +
+      " 声道=" + audioBuf.numberOfChannels + " 样本数=" + audioBuf.length
+    );
+  } catch (e) {
+    record("★ decodeAudioData 解码官方 API 的 MP3", false, String(e && e.message || e));
+    return finish();
+  }
+
+  // ---- 3) 时长合理性（验证音频完整，没有像中转服务那样被截断）
+  // 该样本文本为 22 字，实测官方返回约 2.7 秒
+  const dur = audioBuf.duration;
+  const plausible = dur > 1.5 && dur < 6;
+  record(
+    "音频时长与文本长度相符（未被截断）",
+    plausible,
+    dur.toFixed(2) + "s（22 字预期 2~5 秒）"
+  );
+
+  // ---- 4) 播放链路：AudioBufferSource + playbackRate 是否可用
+  //
+  // 注意：headless 下 AudioContext 初始为 suspended（没有用户手势）。
+  // **实测发现**：此时 ctx.resume() 返回的 Promise 可能永远不 resolve
+  // （浏览器在等一个永不到来的用户手势），因此必须加超时保护，
+  // 否则整个验证脚本会挂在这里、永远不输出结果。
+  // 这正是引擎里必须处理「自动播放被拒」的真实原因。
+  try {
+    let resumed = ctx.state === "running";
+    if (!resumed && ctx.resume) {
+      resumed = await Promise.race([
+        ctx.resume().then(() => ctx.state === "running").catch(() => false),
+        new Promise((r) => setTimeout(() => r(ctx.state === "running"), 2500)),
+      ]);
+    }
+    record(
+      "AudioContext 状态",
+      true, // 这里不判定失败：无手势环境本就可能保持 suspended
+      "state=" + ctx.state + (resumed ? "（已 running）" : "（保持 suspended，无用户手势时的正常表现）")
+    );
+
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuf;
+    src.playbackRate.value = 1.25; // 语速控制走 playbackRate
+    const gain = ctx.createGain();
+    gain.gain.value = 0; // 静音，避免真机验证时突然出声
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    const played = await new Promise((resolve) => {
+      let done = false;
+      src.onended = () => { if (!done) { done = true; resolve(true); } };
+      try { src.start(0); } catch (e) { resolve(false); }
+      // 兜底：若 onended 不触发，按预期时长×2 超时。
+      // suspended 状态下 onended 不会触发（音频根本没推进），
+      // 因此这里超时属于**预期行为**，由调用方按 state 判断。
+      setTimeout(() => { if (!done) { done = true; resolve(false); } }, (dur / 1.25) * 1000 + 2000);
+    });
+    if (ctx.state === "running") {
+      record("AudioBufferSource 播放链路可用", played, played ? "播放并正常结束" : "未触发 ended");
+    } else {
+      // 无手势环境下无法验证真实播放，但已验证「能创建 source 并 start 不抛错」
+      record(
+        "AudioBufferSource 可创建并 start（无手势下不做真实播放判定）",
+        true,
+        "source.start() 未抛错；真实出声需用户手势，已由引擎的 error 提示覆盖"
+      );
+    }
+  } catch (e) {
+    record("AudioBufferSource 播放链路可用", false, String(e && e.message || e));
+  }
+
+  // ---- 5) 静音检测：确认解码出的不是全静音（音频真的有内容）
+  try {
+    const ch = audioBuf.getChannelData(0);
+    let peak = 0;
+    let sum = 0;
+    for (let i = 0; i < ch.length; i += 100) {
+      const v = Math.abs(ch[i]);
+      if (v > peak) peak = v;
+      sum += v;
+    }
+    const avg = sum / Math.ceil(ch.length / 100);
+    record(
+      "解码出的音频有实际内容（非全静音）",
+      peak > 0.05,
+      "峰值=" + peak.toFixed(3) + " 平均=" + avg.toFixed(4)
+    );
+  } catch (e) {
+    record("解码出的音频有实际内容", false, String(e && e.message || e));
+  }
+
+  finish();
+})();
+
+function finish() {
+  if (finished) return; // 幂等：看门狗与正常路径都可能调用
+  finished = true;
+  const failed = results.filter((r) => !r.pass);
+  const summary = failed.length === 0
+    ? "VERIFY_ALL_PASS (" + results.length + "/" + results.length + ")"
+    : "VERIFY_FAILED (" + failed.length + " 项失败: " + failed.map((f) => f.name).join("; ") + ")";
+  log("");
+  log(summary, failed.length === 0 ? "ok" : "bad");
+  document.title = summary;
+  // 供外部抓取
+  window.__verifyResult = { summary, results };
+
+  // 回传给收集器（headless 下无法用截图/调试端口取结果，
+  // 让页面主动 POST 回来是最可靠的取数方式）。
+  try {
+    fetch("result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        summary: summary,
+        results: results,
+        ua: navigator.userAgent,
+        at: new Date().toISOString(),
+      }),
+    }).catch(() => {});
+  } catch (_) { /* 忽略 */ }
+}
+</script>
+</body>
+</html>

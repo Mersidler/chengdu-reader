@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "澄读 · 阅读模式",
-  "version": "0.1.0",
-  "description": "沉浸式阅读模式，自动清理正文中的空白行与多余间距，让长文更清爽易读。",
+  "version": "0.2.0",
+  "description": "沉浸式阅读模式：自动清理正文空白行、滚动到底自动续章，并支持小米 MiMo 语音合成有声朗读。",
   "browser_specific_settings": {
     "gecko": {
       "id": "chengdu-reader@local.dev",

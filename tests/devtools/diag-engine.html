@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>诊断：真实引擎播放路径是否出声</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .info { color: #93c5fd; } .warn { color: #fbbf24; }
+</style>
+</head>
+<body>
+<h1>诊断：真实引擎播放路径是否出声</h1>
+<div id="log"></div>
+
+<!-- 加载真实引擎代码（由 dev-server 提供源码） -->
+<script src="/src/content/tts-text.js"></script>
+<script src="/src/content/tts.js"></script>
+<script>
+/**
+ * 用**真实的引擎代码**跑一遍播放，判定到底有没有出声。
+ *
+ * ## 手法
+ *
+ * 1. 环境准备：测试 profile 里把 Firefox 的自动播放策略设为「允许」，
+ *    这样 AudioContext 会直接以 running 启动，等价于用户手势已授权。
+ * 2. 探针：monkey-patch `AudioNode.prototype.connect`，
+ *    凡是 AudioBufferSource 连到别处时，**同时**连一个 AnalyserNode。
+ *    这样就能读到「音频数据是否真的在推进」——比 onended 更硬，
+ *    因为 suspended 时 onended 不触发，但也不排除其他原因。
+ * 3. 用真实引擎：createTts + configure + primeAudio + start，
+ *    合成器注入真实音频（从 sample-tts.mp3 转 base64），
+ *    其余（解码、播放、状态机）全是生产代码。
+ */
+const log = (m, cls) => {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = m;
+  document.getElementById("log").appendChild(d);
+};
+const results = [];
+let finished = false;
+const rec = (name, pass, detail) => {
+  results.push({ name, pass, detail });
+  log((pass ? "✔ " : "✘ ") + name + (detail ? "  — " + detail : ""), pass ? "ok" : "bad");
+};
+setTimeout(() => { if (!finished) { log("看门狗：25s 未完成", "bad"); finish(); } }, 25000);
+
+// ---- 探针：捕获引擎创建的 AudioContext，并在音频图上挂 Analyser
+let capturedCtx = null;
+let tapAnalyser = null;
+let tapPeak = 0;
+let tapSamples = 0;
+
+(function installProbe() {
+  const OrigAC = window.AudioContext || window.webkitAudioContext;
+  if (!OrigAC) return;
+  const Wrapped = function (...args) {
+    const c = new OrigAC(...args);
+    if (!capturedCtx) {
+      capturedCtx = c;
+      try {
+        tapAnalyser = c.createAnalyser();
+        tapAnalyser.fftSize = 2048;
+        tapAnalyser.connect(c.destination);
+      } catch (_) {}
+    }
+    return c;
+  };
+  Wrapped.prototype = OrigAC.prototype;
+  window.AudioContext = Wrapped;
+  window.webkitAudioContext = Wrapped;
+
+  // 让每个 buffer source 除了正常连接外，也连到探针
+  const origConnect = AudioNode.prototype.connect;
+  AudioNode.prototype.connect = function (dest, ...rest) {
+    try {
+      const isSource = this && this.buffer && typeof this.start === "function";
+      if (isSource && tapAnalyser && dest !== tapAnalyser) {
+        origConnect.call(this, tapAnalyser);
+      }
+    } catch (_) {}
+    return origConnect.call(this, dest, ...rest);
+  };
+})();
+
+/** 采样探针当前峰值。 */
+function readTap() {
+  if (!tapAnalyser) return 0;
+  const d = new Float32Array(tapAnalyser.fftSize);
+  tapAnalyser.getFloatTimeDomainData(d);
+  let p = 0;
+  for (const v of d) p = Math.max(p, Math.abs(v));
+  tapSamples++;
+  tapPeak = Math.max(tapPeak, p);
+  return p;
+}
+
+(async function main() {
+  rec("AudioContext 构造可用", Boolean(window.AudioContext), "patched");
+
+  // ---- 取真实音频并转 base64（引擎的 synth 返回 base64）
+  let b64 = "";
+  try {
+    const res = await fetch("sample-tts.mp3");
+    const ab = await res.arrayBuffer();
+    const bytes = new Uint8Array(ab);
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    b64 = btoa(s);
+    rec("准备音频样本", b64.length > 0, ab.byteLength + " 字节 → base64 " + b64.length);
+  } catch (e) {
+    rec("准备音频样本", false, String(e && e.message || e));
+    return finish();
+  }
+
+  // ---- 造正文（供引擎扫描）
+  const content = document.createElement("div");
+  content.className = "rd-content";
+  for (let i = 0; i < 3; i++) {
+    const p = document.createElement("p");
+    p.textContent = "这是第" + (i + 1) + "段用于诊断的正文内容，需要足够长才能形成独立的朗读单元。";
+    content.appendChild(p);
+  }
+  document.body.appendChild(content);
+
+  // ---- 用真实引擎
+  const TtsText = window.TtsText;
+  const ReaderTts = window.ReaderTts;
+  if (!TtsText || !ReaderTts) {
+    rec("加载引擎模块", false, "TtsText=" + typeof TtsText + " ReaderTts=" + typeof ReaderTts);
+    return finish();
+  }
+  rec("加载引擎模块", true, "TtsText + ReaderTts 就绪");
+
+  const events = [];
+  let synthCalls = 0;
+  const tts = ReaderTts.createTts({
+    text: TtsText,
+    getContent: () => content,
+    getTitle: () => "诊断章节",
+    onState: (s) => events.push(s.state),
+    onCueChange: () => {},
+    onNeedNext: async () => false,
+    highlight: () => {},
+    scrollTo: () => {},
+    // 真实音频，其余全走生产代码
+    synth: async () => { synthCalls++; return { ok: true, audio: b64, format: "mp3" }; },
+    url: "https://diag.example/1.html",
+  });
+
+  tts.configure({ apiKey: "sk-diag", voice: "茉莉", rate: 1, mode: "paragraph" });
+
+  // ★ 模拟用户手势：primeAudio 在点击栈里同步调用
+  const primed = tts.primeAudio();
+  rec("primeAudio() 返回", true, "primed=" + primed + " ctxState=" +
+    (capturedCtx ? capturedCtx.state : "none"));
+
+  const started = await tts.start();
+  rec("start() 返回", started === true, "started=" + started);
+
+  // 等播放真正开始，并持续采样探针
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    readTap();
+    const st = tts.getState();
+    if (st.state === "playing" && tapPeak > 0.001) break;
+  }
+
+  const st1 = tts.getState();
+  rec(
+    "★ 音频是否真的流过（探针峰值）",
+    tapPeak > 0.001,
+    "峰值=" + tapPeak.toFixed(5) + " ctxState=" + (capturedCtx ? capturedCtx.state : "none") +
+      " state=" + st1.state + " 采样次数=" + tapSamples
+  );
+
+  rec("引擎状态进入 playing", st1.state === "playing", "state=" + st1.state + " events=" + events.join("→"));
+  rec("合成被调用", synthCalls > 0, synthCalls + " 次");
+
+  // 再等一会儿看是否能推进到下一条（onended 是否触发）
+  const before = tts.getState().playedCount;
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    readTap();
+    if (tts.getState().playedCount > before) break;
+  }
+  const st2 = tts.getState();
+  rec(
+    "★ onended 是否触发（能否推进到下一条）",
+    st2.playedCount > before || st2.state === "playing",
+    "playedCount " + before + " → " + st2.playedCount + "，峰值=" + tapPeak.toFixed(5)
+  );
+
+  tts.destroy();
+  finish();
+})();
+
+function finish() {
+  if (finished) return;
+  finished = true;
+  const failed = results.filter((r) => !r.pass);
+  const s = failed.length === 0
+    ? "ENGINE_ALL_PASS (" + results.length + ")"
+    : "ENGINE_ISSUES (" + failed.map((f) => f.name).join(" | ") + ")";
+  log("");
+  log(s, failed.length ? "bad" : "ok");
+  log("最终探针峰值=" + tapPeak.toFixed(5) + "（>0.001 表示确实出声）", tapPeak > 0.001 ? "ok" : "bad");
+  try {
+    fetch("result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ summary: s, results, tapPeak, ua: navigator.userAgent }),
+    }).catch(() => {});
+  } catch (_) {}
+}
+</script>
+</body>
+</html>

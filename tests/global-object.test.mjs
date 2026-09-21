@@ -170,7 +170,8 @@ test("★ window !== globalThis 时，模块必须挂在 globalThis 上且被正
   // 模块应挂在 globalThis 上（UMD 的 root 取 globalThis）
   for (const name of [
     "Readability", "CleanDomUtils", "CleanBlank", "ReaderExtract",
-    "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "ReaderView",
+    "ReaderPrefs", "ReaderStyles", "ReaderToolbar", "AutoNext",
+    "TtsText", "TtsBar", "ReaderTts", "ReaderView",
   ]) {
     assert.notEqual(
       sandbox[name], undefined,

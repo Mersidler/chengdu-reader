@@ -1,15 +1,15 @@
 {
   "name": "chengdu-reader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Firefox 沉浸式阅读扩展：自动清理正文空白行与多余间距",
   "type": "commonjs",
   "scripts": {
     "vendor": "node tools/vendor-readability.mjs",
     "test": "node --test",
-    "lint": "npx --yes web-ext lint  --source-dir . --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore",
-    "start": "npx --yes web-ext run --source-dir . --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore",
-    "build": "npx --yes web-ext build --source-dir . --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore --filename chengdu-reader-{version}.zip --overwrite-dest --artifacts-dir dist"
+    "lint": "npx --yes web-ext lint  --source-dir . --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore .web-ext-profile .tts-key .tts-key-probe",
+    "start": "npx --yes web-ext run --source-dir . --firefox-profile .web-ext-profile --keep-profile-changes --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore .web-ext-profile .tts-key .tts-key-probe",
+    "build": "npx --yes web-ext build --source-dir . --ignore-files tests tools dist package.json package-lock.json node_modules README.md .gitignore .web-ext-profile .tts-key .tts-key-probe --filename chengdu-reader-{version}.zip --overwrite-dest --artifacts-dir dist"
   },
   "devDependencies": {
     "jsdom": "^24.0.0"

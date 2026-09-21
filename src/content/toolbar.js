@@ -26,6 +26,9 @@
    * @param {object} opts.prefs 初始偏好（会被就地修改）
    * @param {Function} opts.onChange 偏好变化回调，收到完整偏好对象
    * @param {Function} opts.onClose 关闭回调
+   * @param {Function} [opts.onToggleClean] 空行清理开关变化
+   * @param {Function} [opts.onToggleAutoNext] 自动续页开关变化
+   * @param {Function} [opts.onToggleTts] 朗读开关变化
    * @param {object} [opts.cleanStats] 清理统计，用于展示效果
    */
   function create(opts) {
@@ -142,6 +145,18 @@
       if (opts.onToggleAutoNext) opts.onToggleAutoNext(prefs.autoLoadNext);
     });
 
+    // ---------------------------------------------------------- 有声朗读
+    // 顶部工具条只放「是否启用朗读」这一个开关；真正的播放控制
+    // （播放/暂停、上下条、语速、音色、粒度）都在底部的 .rd-tts-bar 里，
+    // 避免顶部控件膨胀到换行、挤压正文。
+
+    const ttsBtn = btn("", "开关有声朗读（用小米 MiMo TTS 合成语音）", () => {
+      prefs.ttsEnabled = !prefs.ttsEnabled;
+      emit();
+      // 即时生效：打开则开始朗读，关闭则停止并收起播放条。
+      if (opts.onToggleTts) opts.onToggleTts(prefs.ttsEnabled);
+    });
+
     // ---------------------------------------------------------- 关闭
 
     const closeBtn = btn("✕", "退出阅读模式 (Esc)", onClose);
@@ -155,7 +170,7 @@
       lhDown, lineHeightLabel, lhUp, sep(),
       gapDown, paraGapLabel, gapUp, sep(),
       widthBtn, fontBtn, sep(),
-      cleanBtn, autoNextBtn, sep(),
+      cleanBtn, autoNextBtn, ttsBtn, sep(),
       closeBtn
     );
 
@@ -182,6 +197,13 @@
         ? "已开启自动续页：滚动到底会自动加载下一章/下一页（点击关闭）"
         : "已关闭自动续页：滚动到底不会自动加载（点击开启）";
       autoNextBtn.setAttribute("aria-pressed", String(!!p.autoLoadNext));
+
+      // 朗读开关。文案用「听书」二字，比「朗读」更能表达这是长时间收听。
+      ttsBtn.textContent = p.ttsEnabled ? "听书 ✓" : "听书 ✗";
+      ttsBtn.title = p.ttsEnabled
+        ? "已开启有声朗读（点击停止并收起播放条）"
+        : "开启有声朗读：用小米 MiMo TTS 把正文合成语音（需先填 API Key）";
+      ttsBtn.setAttribute("aria-pressed", String(!!p.ttsEnabled));
     }
 
     function emit() {

@@ -294,3 +294,164 @@ test("注入的模块清单与文件系统一致", () => {
     "reader-view 必须在 main 之前"
   );
 });
+
+// ============================================================ TTS 合成消息
+
+/**
+ * 造一个带 runtime.onMessage 的 mock 环境，用于测试 cd-tts-synth 处理器。
+ *
+ * @param {Function} fetchImpl 替换全局 fetch
+ */
+function loadBackgroundWithTts(fetchImpl) {
+  let messageListener = null;
+  const browserMock = {
+    action: {
+      onClicked: { addListener: () => {} },
+      setBadgeText: () => {}, setBadgeBackgroundColor: () => {}, setTitle: () => {},
+    },
+    commands: { onCommand: { addListener: () => {} }, update: async () => {}, getAll: async () => [] },
+    scripting: { executeScript: async () => [] },
+    tabs: { query: async () => [] },
+    runtime: {
+      getManifest: () => ({ version: "0.1.0" }),
+      onMessage: { addListener: (fn) => { messageListener = fn; } },
+    },
+  };
+
+  const sandbox = {
+    browser: browserMock,
+    chrome: undefined,
+    console: { debug() {}, warn() {}, log() {}, error() {} },
+    setTimeout, clearTimeout,
+    fetch: fetchImpl,
+    AbortController: typeof AbortController !== "undefined" ? AbortController : undefined,
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(BG_SOURCE, sandbox, { filename: "background.js" });
+
+  return {
+    /** 发一条消息并等响应。 */
+    send: (msg) => new Promise((resolve) => {
+      const ret = messageListener(msg, { tab: { id: 1 } }, resolve);
+      // 处理器返回 true 表示异步响应
+      if (ret !== true) resolve(undefined);
+    }),
+    hasListener: () => Boolean(messageListener),
+  };
+}
+
+test("TTS：非本协议的消息被忽略", async () => {
+  const bg = loadBackgroundWithTts(async () => { throw new Error("不应发起请求"); });
+  const res = await bg.send({ type: "other-message" });
+  assert.equal(res, undefined, "非 cd-tts-synth 消息应被忽略");
+});
+
+test("TTS：缺 API Key 时直接失败，不发请求", async () => {
+  let fetched = false;
+  const bg = loadBackgroundWithTts(async () => { fetched = true; return { ok: true }; });
+  const res = await bg.send({ type: "cd-tts-synth", text: "测试", apiKey: "" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "no-api-key");
+  assert.equal(fetched, false, "缺 key 不应发起网络请求");
+});
+
+test("TTS：空文本直接失败", async () => {
+  const bg = loadBackgroundWithTts(async () => { throw new Error("不应发起请求"); });
+  const res = await bg.send({ type: "cd-tts-synth", text: "   ", apiKey: "sk-x" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "empty-text");
+});
+
+test("TTS：超长文本被拒（避免一次请求等几分钟）", async () => {
+  const bg = loadBackgroundWithTts(async () => { throw new Error("不应发起请求"); });
+  const res = await bg.send({ type: "cd-tts-synth", text: "字".repeat(3000), apiKey: "sk-x" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "too-long");
+});
+
+test("★ TTS：请求形态正确（模型/messages 含 assistant role/audio 参数）", async () => {
+  let captured = null;
+  const bg = loadBackgroundWithTts(async (url, init) => {
+    captured = { url, init };
+    return {
+      ok: true,
+      async json() {
+        return { choices: [{ message: { audio: { data: "AAAA" } } }] };
+      },
+    };
+  });
+  const res = await bg.send({
+    type: "cd-tts-synth", text: "今天天气很好。", apiKey: "sk-test", voice: "茉莉", format: "mp3",
+  });
+
+  assert.equal(res.ok, true, "应成功");
+  assert.equal(res.audio, "AAAA");
+  assert.ok(captured, "应发起请求");
+
+  // 端点：TTS 走 OpenAI 兼容的 chat/completions（实测无 /audio/speech）
+  assert.match(captured.url, /\/v1\/chat\/completions$/, "应请求 chat/completions");
+
+  const body = JSON.parse(captured.init.body);
+  assert.equal(body.model, "mimo-v2.5-tts");
+  // ★ 实测约束：messages 必须含 assistant role，否则服务端报
+  //   "messages must contain an assistant role for TTS model"
+  assert.ok(
+    body.messages.some((m) => m.role === "assistant"),
+    "messages 必须含 assistant role（否则服务端拒绝）"
+  );
+  assert.equal(
+    body.messages.find((m) => m.role === "assistant").content,
+    "今天天气很好。",
+    "要朗读的文本必须放在 assistant 的 content 里"
+  );
+  assert.deepEqual(body.audio, { voice: "茉莉", format: "mp3" });
+  assert.equal(captured.init.headers.Authorization, "Bearer sk-test");
+});
+
+test("TTS：非法音色回退到默认（不把错误音色发给服务端）", async () => {
+  let captured = null;
+  const bg = loadBackgroundWithTts(async (url, init) => {
+    captured = init;
+    return { ok: true, async json() { return { choices: [{ message: { audio: { data: "AA" } } }] }; } };
+  });
+  await bg.send({ type: "cd-tts-synth", text: "测试。", apiKey: "sk-x", voice: "不存在的音色" });
+  const body = JSON.parse(captured.body);
+  assert.ok(
+    ["茉莉", "冰糖", "苏打", "白桦"].includes(body.audio.voice),
+    `非法音色应回退到默认，实际 ${body.audio.voice}`
+  );
+});
+
+test("TTS：HTTP 错误带上服务端返回的原因", async () => {
+  const bg = loadBackgroundWithTts(async () => ({
+    ok: false,
+    status: 400,
+    async json() {
+      return { error: { code: "400", param: "Unknown voice: xxx. Available voices: [冰糖]" } };
+    },
+  }));
+  const res = await bg.send({ type: "cd-tts-synth", text: "测试。", apiKey: "sk-x", voice: "xxx" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "http-error");
+  assert.equal(res.status, 400);
+  assert.match(res.message, /Unknown voice/, "应把服务端的错误原因带回来，便于用户定位");
+});
+
+test("TTS：响应里没有音频数据时明确失败", async () => {
+  const bg = loadBackgroundWithTts(async () => ({
+    ok: true,
+    async json() { return { choices: [{ message: { content: "只有文字没有音频" } }] }; },
+  }));
+  const res = await bg.send({ type: "cd-tts-synth", text: "测试。", apiKey: "sk-x" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "no-audio");
+});
+
+test("TTS：网络异常被转成可序列化的失败结果", async () => {
+  const bg = loadBackgroundWithTts(async () => { throw new Error("connection refused"); });
+  const res = await bg.send({ type: "cd-tts-synth", text: "测试。", apiKey: "sk-x" });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "network-error");
+  assert.match(res.message, /connection refused/);
+});

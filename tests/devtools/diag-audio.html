@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>诊断：朗读无声的根因</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #111; color: #eee; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .info { color: #93c5fd; } .warn { color: #fbbf24; }
+</style>
+</head>
+<body>
+<h1>诊断：朗读无声的根因</h1>
+<div id="log"></div>
+<script>
+/**
+ * 用真实浏览器判定「引擎的播放路径到底有没有出声」。
+ *
+ * 关键手法：**用 OfflineAudioContext 之外的普通 AudioContext，
+ * 但把音频接到一个 AnalyserNode 上**——如果 source.start() 之后
+ * 分析节点能读到非零采样，就说明音频真的在推进（出声）；
+ * 若一直是 0，说明音频没被播放（context 没 running 或 source 没启动）。
+ *
+ * 这比「onended 是否触发」更可靠：onended 在 suspended 时不会触发，
+ * 但也不排除其他原因。这里直接测「音频数据有没有流过」。
+ */
+const log = (m, cls) => {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = m;
+  document.getElementById("log").appendChild(d);
+};
+const results = [];
+let finished = false;
+const rec = (name, pass, detail) => {
+  results.push({ name, pass, detail });
+  log((pass ? "✔ " : "✘ ") + name + (detail ? "  — " + detail : ""), pass ? "ok" : "bad");
+};
+setTimeout(() => { if (!finished) { log("看门狗：20s 未完成", "bad"); finish(); } }, 20000);
+
+(async function main() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ctx;
+  try { ctx = new AC(); } catch (e) { rec("创建 AudioContext", false, e.message); return finish(); }
+  rec("创建 AudioContext", true, "state=" + ctx.state);
+
+  // 取真实音频
+  let buf;
+  try {
+    const res = await fetch("sample-tts.mp3");
+    buf = await res.arrayBuffer();
+    rec("取音频", res.ok, buf.byteLength + " 字节");
+  } catch (e) { rec("取音频", false, e.message); return finish(); }
+
+  let audioBuf;
+  try {
+    audioBuf = await new Promise((ok, bad) => {
+      const p = ctx.decodeAudioData(buf.slice(0), ok, bad);
+      if (p && p.then) p.then(ok).catch(bad);
+    });
+    rec("解码", true, audioBuf.duration.toFixed(2) + "s");
+  } catch (e) { rec("解码", false, String(e && e.message || e)); return finish(); }
+
+  // ---- 核心诊断：接 AnalyserNode 测「音频是否真的流过」
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.connect(ctx.destination);
+
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(analyser);
+
+  // 测试 A：不 resume，直接 start（复现「无声」场景）
+  let endedA = false;
+  src.onended = () => { endedA = true; };
+  try { src.start(0); } catch (e) { rec("start", false, e.message); }
+  await new Promise(r => setTimeout(r, 800));
+  const dataA = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(dataA);
+  let peakA = 0;
+  for (const v of dataA) peakA = Math.max(peakA, Math.abs(v));
+  rec(
+    "A) 未 resume 直接 start → 音频是否流过",
+    peakA > 0.001,
+    "峰值=" + peakA.toFixed(5) + " state=" + ctx.state + " ended=" + endedA +
+      (peakA <= 0.001 ? "  ← 这就是「无声」" : "")
+  );
+
+  // 测试 B：resume 后再 start
+  try { src.stop(); } catch (_) {}
+  let resumeSettled = false;
+  try {
+    if (ctx.resume) {
+      ctx.resume().then(() => { resumeSettled = true; });
+    }
+  } catch (_) {}
+  await new Promise(r => setTimeout(r, 600));
+  rec("B) resume() 是否 resolve", resumeSettled, "state=" + ctx.state);
+
+  const src2 = ctx.createBufferSource();
+  src2.buffer = audioBuf;
+  src2.connect(analyser);
+  let endedB = false;
+  src2.onended = () => { endedB = true; };
+  try { src2.start(0); } catch (e) { rec("B) start", false, e.message); }
+  await new Promise(r => setTimeout(r, 800));
+  const dataB = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(dataB);
+  let peakB = 0;
+  for (const v of dataB) peakB = Math.max(peakB, Math.abs(v));
+  rec(
+    "B) resume 后 start → 音频是否流过",
+    peakB > 0.001,
+    "峰值=" + peakB.toFixed(5) + " state=" + ctx.state
+  );
+
+  // 测试 C：接 destination 之外，检查 gain 是否为 0（我代码里用 gain 控音量）
+  const gain = ctx.createGain();
+  rec(
+    "C) 新建 GainNode 默认音量",
+    gain.gain.value === 1,
+    "gain=" + gain.gain.value + (gain.gain.value === 0 ? "  ← 若为 0 则完全无声" : "")
+  );
+
+  // 测试 D：playbackRate 是否被设成异常值
+  const src3 = ctx.createBufferSource();
+  rec(
+    "D) 新建 source 默认 playbackRate",
+    src3.playbackRate.value === 1,
+    "rate=" + src3.playbackRate.value
+  );
+
+  finish();
+})();
+
+function finish() {
+  if (finished) return;
+  finished = true;
+  const failed = results.filter(r => !r.pass);
+  const s = failed.length === 0
+    ? "DIAG_ALL_PASS (" + results.length + ")"
+    : "DIAG_ISSUES (" + failed.map(f => f.name).join(" | ") + ")";
+  log(""); log(s, failed.length ? "bad" : "ok");
+  try {
+    fetch("result", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ summary: s, results, ua: navigator.userAgent }),
+    }).catch(() => {});
+  } catch (_) {}
+}
+</script>
+</body>
+</html>
